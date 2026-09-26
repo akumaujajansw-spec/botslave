@@ -6,56 +6,28 @@ import base64
 import threading
 import requests
 import telebot
+from telebot.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 
-from telebot.types import (
-    ReplyKeyboardMarkup, KeyboardButton,
-    InlineKeyboardMarkup, InlineKeyboardButton
-)
-
-# ============================================================
-# KONFIGURASI
-# ============================================================
 TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
-
-# Kredensial KlikQRIS WAJIB disimpan di Railway Variables.
+ADMIN_ID_RAW = os.getenv("ADMIN_ID")
 KLIQRIS_API_KEY = os.getenv("KLIQRIS_API_KEY")
 KLIQRIS_MERCHANT_ID = os.getenv("KLIQRIS_MERCHANT_ID")
-
-# API produksi KlikQRIS
 KLIQRIS_BASE_URL = os.getenv("KLIQRIS_BASE_URL", "https://klikqris.com/api")
-
-# Harga paket
 PACKAGE_PRICE = 30000
-
-# Cek status pembayaran setiap N detik
 PAYMENT_CHECK_INTERVAL = int(os.getenv("PAYMENT_CHECK_INTERVAL", "10"))
 
-# ID Grup VIP 3 Grup
-VIP_GROUP_IDS = [
-    -1004451939488,
-    -1004486985873,
-    -1003813292350
-]
+VIP_GROUP_IDS = [-1004451939488, -1004486985873, -1003813292350]
+SLAVE_GROUP_IDS = [-1003755316830]
 
-# ID Grup Paket Slave
-SLAVE_GROUP_IDS = [
-    -1003755316830
-]
+try:
+    ADMIN_ID = int(ADMIN_ID_RAW) if ADMIN_ID_RAW else 0
+except ValueError:
+    ADMIN_ID = 0
 
-bot = telebot.TeleBot(TOKEN)
-
-# {telegram_user_id: {"order_id": ..., "package": ..., "message_id": ...,
-#                     "total_amount": ..., "expired_at": ..., "status": ...}}
+bot = telebot.TeleBot(TOKEN) if TOKEN else None
 active_transactions = {}
-
-# Paket terakhir yang dipilih user
 user_selected_package = {}
 
-
-# ============================================================
-# HELPER
-# ============================================================
 def check_config():
     missing = []
     if not TOKEN:
@@ -66,12 +38,8 @@ def check_config():
         missing.append("KLIQRIS_API_KEY")
     if not KLIQRIS_MERCHANT_ID:
         missing.append("KLIQRIS_MERCHANT_ID")
-
     if missing:
-        raise RuntimeError(
-            "Environment variable belum diisi: " + ", ".join(missing)
-        )
-
+        raise RuntimeError("Environment variable belum diisi: " + ", ".join(missing))
 
 def main_menu():
     markup = ReplyKeyboardMarkup(resize_keyboard=True)
@@ -81,152 +49,119 @@ def main_menu():
     markup.add(KeyboardButton("📞 Hubungi Admin"))
     return markup
 
-
 def package_info(pkg_code):
-    if pkg_code == "vip":
-        return "Tambahan Paket VIP 3 Grup", VIP_GROUP_IDS
-    return "Paket Slave", SLAVE_GROUP_IDS
-
-
-def create_order_id(user_id):
-    # Harus unik di KlikQRIS.
-    return f"WD-{int(time.time())}-{user_id}"
-
+    return ("Tambahan Paket VIP 3 Grup", VIP_GROUP_IDS) if pkg_code == "vip" else ("Paket Slave", SLAVE_GROUP_IDS)
 
 def klikqris_headers():
-    return {
-        "Content-Type": "application/json",
-        "x-api-key": KLIQRIS_API_KEY,
-        "id_merchant": KLIQRIS_MERCHANT_ID,
-    }
+    return {"Content-Type": "application/json", "x-api-key": KLIQRIS_API_KEY, "id_merchant": KLIQRIS_MERCHANT_ID}
 
+def create_order_id(user_id):
+    return f"WD-{int(time.time())}-{user_id}"
 
 def create_klikqris_transaction(order_id, pkg_label):
-    """
-    Membuat QRIS dinamis melalui KlikQRIS.
-    Endpoint: POST /qris/create
-    """
     url = f"{KLIQRIS_BASE_URL}/qris/create"
-
     payload = {
         "order_id": order_id,
         "id_merchant": KLIQRIS_MERCHANT_ID,
         "amount": PACKAGE_PRICE,
         "keterangan": f"Pembayaran {pkg_label}",
     }
-
-    response = requests.post(
-        url,
-        json=payload,
-        headers=klikqris_headers(),
-        timeout=30,
-    )
+    response = requests.post(url, json=payload, headers=klikqris_headers(), timeout=30)
 
     try:
         result = response.json()
     except Exception:
-        raise RuntimeError(
-            f"KlikQRIS mengembalikan response bukan JSON "
-            f"(HTTP {response.status_code}): {response.text[:500]}"
-        )
+        raise RuntimeError(f"KlikQRIS HTTP {response.status_code}, response bukan JSON: {response.text[:500]}")
 
-    if response.status_code != 200 or not result.get("status"):
-        raise RuntimeError(
-            f"KlikQRIS HTTP {response.status_code}: "
-            f"{result.get('message', result)}"
-        )
+    # KlikQRIS berhasil membuat transaksi dengan HTTP 201.
+    if not (200 <= response.status_code < 300):
+        raise RuntimeError(f"KlikQRIS HTTP {response.status_code}: {result.get('message', result)}")
+
+    if result.get("status") is False:
+        raise RuntimeError(f"KlikQRIS HTTP {response.status_code}: {result.get('message', result)}")
 
     data = result.get("data") or {}
-    if not data.get("order_id"):
-        raise RuntimeError(f"Response KlikQRIS tidak memiliki order_id: {result}")
+    if not data:
+        data = {k: result.get(k) for k in ("order_id", "qris_image", "qris_url", "total_amount", "expired_at", "status") if result.get(k) is not None}
 
+    if not data:
+        raise RuntimeError(f"KlikQRIS berhasil membuat transaksi, tetapi data transaksi tidak ditemukan: {result}")
+
+    data.setdefault("order_id", order_id)
     return data
 
-
 def check_klikqris_status(order_id):
-    """
-    Cek status transaksi:
-    GET /qris/status/{order_id}
-    """
     url = f"{KLIQRIS_BASE_URL}/qris/status/{order_id}"
-
-    response = requests.get(
-        url,
-        headers=klikqris_headers(),
-        timeout=20,
-    )
+    response = requests.get(url, headers=klikqris_headers(), timeout=20)
 
     try:
         result = response.json()
     except Exception:
-        raise RuntimeError(
-            f"Response status bukan JSON (HTTP {response.status_code})"
-        )
+        raise RuntimeError(f"KlikQRIS status HTTP {response.status_code}, response bukan JSON.")
 
-    if response.status_code != 200 or not result.get("status"):
-        raise RuntimeError(
-            f"KlikQRIS status HTTP {response.status_code}: "
-            f"{result.get('message', result)}"
-        )
+    if not (200 <= response.status_code < 300):
+        raise RuntimeError(f"KlikQRIS status HTTP {response.status_code}: {result.get('message', result)}")
 
-    return result.get("data") or {}
+    if result.get("status") is False:
+        raise RuntimeError(f"KlikQRIS status: {result.get('message', result)}")
 
+    data = result.get("data") or {}
+    if not data:
+        data = {k: result.get(k) for k in ("order_id", "status", "payment_status", "transaction_status", "expired_at", "paid_at") if result.get(k) is not None}
+    return data
 
 def decode_qris_image(data):
-    """
-    KlikQRIS dapat mengembalikan:
-      qris_image = data:image/png;base64,...
-    atau qris_url = URL gambar.
-    """
     qris_image = data.get("qris_image")
-
     if qris_image:
-        if qris_image.startswith("data:image"):
+        if isinstance(qris_image, str) and qris_image.startswith("data:image"):
             try:
-                encoded = qris_image.split(",", 1)[1]
-                return io.BytesIO(base64.b64decode(encoded))
-            except Exception as e:
-                raise RuntimeError(f"Gagal decode qris_image: {e}")
+                return io.BytesIO(base64.b64decode(qris_image.split(",", 1)[1]))
+            except Exception as exc:
+                raise RuntimeError(f"Gagal decode qris_image: {exc}")
+        if isinstance(qris_image, str):
+            try:
+                return io.BytesIO(base64.b64decode(qris_image))
+            except Exception:
+                pass
 
     qris_url = data.get("qris_url")
     if qris_url:
-        r = requests.get(qris_url, timeout=30)
-        r.raise_for_status()
-        return io.BytesIO(r.content)
+        try:
+            response = requests.get(qris_url, timeout=30)
+            response.raise_for_status()
+            return io.BytesIO(response.content)
+        except Exception as exc:
+            raise RuntimeError(f"Gagal mengambil qris_url: {exc}")
 
-    raise RuntimeError("KlikQRIS tidak mengembalikan qris_image atau qris_url.")
+    raise RuntimeError(f"KlikQRIS tidak mengembalikan qris_image atau qris_url. Data: {data}")
 
-
-def send_payment_qr(chat_id, pkg_code):
+def send_payment_qr(user_id, pkg_code):
     pkg_label, _ = package_info(pkg_code)
-    order_id = create_order_id(chat_id)
-
+    order_id = create_order_id(user_id)
     data = create_klikqris_transaction(order_id, pkg_label)
-
     total_amount = data.get("total_amount", PACKAGE_PRICE)
     expired_at = data.get("expired_at", "-")
+
+    try:
+        amount_display = f"Rp {int(float(total_amount)):,.0f}"
+    except Exception:
+        amount_display = f"Rp {total_amount}"
 
     qr_file = decode_qris_image(data)
     qr_file.seek(0)
 
     caption = (
         f"💳 <b>{html.escape(pkg_label)}</b>\n\n"
-        f"Nominal pembayaran: <b>Rp {int(float(total_amount)):,.0f}</b>\n"
+        f"Nominal: <b>{amount_display}</b>\n"
         f"Order ID: <code>{html.escape(str(order_id))}</code>\n"
         f"Expired: <b>{html.escape(str(expired_at))}</b>\n\n"
-        "Scan QRIS di atas menggunakan aplikasi pembayaran Anda.\n"
-        "Setelah pembayaran berhasil, bot akan memverifikasi otomatis.\n\n"
-        "⚠️ Bayar sesuai nominal yang tertera pada QRIS."
+        "Silakan scan QRIS di atas dan bayar sesuai nominal yang tertera.\n\n"
+        "✅ Setelah pembayaran berhasil, bot akan mengecek pembayaran secara otomatis.\n"
+        "❌ Tidak perlu mengirim screenshot bukti transfer."
     )
+    sent = bot.send_photo(user_id, qr_file, caption=caption, parse_mode="HTML")
 
-    sent = bot.send_photo(
-        chat_id,
-        qr_file,
-        caption=caption,
-        parse_mode="HTML"
-    )
-
-    active_transactions[chat_id] = {
+    active_transactions[user_id] = {
         "order_id": order_id,
         "package": pkg_code,
         "message_id": sent.message_id,
@@ -235,112 +170,68 @@ def send_payment_qr(chat_id, pkg_code):
         "status": "PENDING",
     }
 
-    return data
-
-
 def cleanup_payment_message(user_id):
-    tx = active_transactions.get(user_id)
-    if not tx:
+    transaction = active_transactions.get(user_id)
+    if not transaction:
         return
-
     try:
-        bot.delete_message(
-            chat_id=user_id,
-            message_id=tx["message_id"]
-        )
+        bot.delete_message(chat_id=user_id, message_id=transaction["message_id"])
     except Exception:
         pass
 
-
 def deliver_package(user_id, pkg_code, order_id):
     pkg_label, target_groups = package_info(pkg_code)
-
     generated_links = []
-
     for group_id in target_groups:
-        invite = bot.create_chat_invite_link(
-            chat_id=group_id,
-            member_limit=1
-        )
+        invite = bot.create_chat_invite_link(chat_id=group_id, member_limit=1)
         generated_links.append(invite.invite_link)
 
-    links_text = "\n".join(
-        [f"• {link}" for link in generated_links]
-    )
-
+    links_text = "\n".join(f"• {link}" for link in generated_links)
     bot.send_message(
         user_id,
         f"✅ <b>Pembayaran Berhasil!</b>\n\n"
         f"Paket: <b>{html.escape(pkg_label)}</b>\n"
-        f"Order ID: <code>{html.escape(order_id)}</code>\n\n"
-        f"Berikut link akses Anda:\n\n"
-        f"{links_text}\n\n"
-        f"<b>Catatan:</b>\n"
-        f"- Setiap link hanya dapat digunakan 1 kali.\n"
-        f"- Jangan bagikan link kepada orang lain.",
-        parse_mode="HTML"
+        f"Order ID: <code>{html.escape(str(order_id))}</code>\n\n"
+        f"Berikut link akses Anda:\n\n{links_text}\n\n"
+        "<b>Catatan:</b>\n- Setiap link hanya dapat digunakan 1 kali.\n- Jangan bagikan link kepada orang lain.",
+        parse_mode="HTML",
     )
 
+def normalize_payment_status(data):
+    for value in (data.get("status"), data.get("payment_status"), data.get("transaction_status")):
+        if value is not None:
+            return str(value).strip().upper()
+    return ""
 
 def payment_monitor():
-    """
-    Background monitor.
-    Mengecek transaksi PENDING dan otomatis memberikan akses
-    ketika status KlikQRIS menjadi SUCCESS/PAID.
-    """
     while True:
         time.sleep(PAYMENT_CHECK_INTERVAL)
-
-        for user_id, tx in list(active_transactions.items()):
+        for user_id, transaction in list(active_transactions.items()):
+            if transaction.get("status") != "PENDING":
+                continue
+            order_id = transaction["order_id"]
             try:
-                if tx.get("status") != "PENDING":
-                    continue
+                data = check_klikqris_status(order_id)
+                status = normalize_payment_status(data)
+                print(f"[KLIQRIS] order={order_id} status={status or 'UNKNOWN'}")
 
-                data = check_klikqris_status(tx["order_id"])
-                status = str(data.get("status", "")).upper()
-
-                if status in ("SUCCESS", "PAID"):
-                    tx["status"] = "SUCCESS"
-
+                if status in {"SUCCESS", "PAID", "SETTLED", "COMPLETED", "BERHASIL"}:
                     try:
-                        deliver_package(
-                            user_id,
-                            tx["package"],
-                            tx["order_id"]
-                        )
-                        cleanup_payment_message(user_id)
+                        deliver_package(user_id, transaction["package"], order_id)
                     except Exception as delivery_error:
-                        # Jangan menghapus transaksi jika pembuatan link gagal.
-                        print(
-                            f"[DELIVERY ERROR] user={user_id} "
-                            f"order={tx['order_id']}: {delivery_error}"
-                        )
+                        print(f"[DELIVERY ERROR] user={user_id} order={order_id}: {delivery_error}")
                         continue
-
-                    del active_transactions[user_id]
-
-                elif status == "EXPIRED":
-                    tx["status"] = "EXPIRED"
-
-                    bot.send_message(
-                        user_id,
-                        "⏰ <b>QRIS sudah kedaluwarsa.</b>\n\n"
-                        "Silakan pilih paket kembali untuk membuat QRIS baru.",
-                        parse_mode="HTML"
-                    )
                     cleanup_payment_message(user_id)
-                    del active_transactions[user_id]
+                    active_transactions.pop(user_id, None)
 
-            except Exception as e:
-                print(
-                    f"[STATUS CHECK ERROR] user={user_id} "
-                    f"order={tx.get('order_id')}: {e}"
-                )
+                elif status in {"EXPIRED", "CANCELLED", "CANCELED"}:
+                    bot.send_message(user_id, "⏰ <b>QRIS sudah kedaluwarsa.</b>\n\nSilakan pilih paket kembali untuk membuat QRIS baru.", parse_mode="HTML")
+                    cleanup_payment_message(user_id)
+                    active_transactions.pop(user_id, None)
 
+            except Exception as exc:
+                print(f"[STATUS CHECK ERROR] user={user_id} order={order_id}: {exc}")
 
-# ============================================================
-# HANDLER
-# ============================================================
 @bot.message_handler(commands=["start"])
 def send_welcome(message):
     bot.send_chat_action(message.chat.id, "typing")
@@ -350,171 +241,77 @@ def send_welcome(message):
         "🔥 <b>Pilihan Paket Pembelian:</b>\n"
         "1. <b>Tambahan Paket VIP 3 Grup</b> — Rp 30.000\n"
         "2. <b>Paket Slave</b> — Rp 30.000\n\n"
-        "QRIS yang dibuat akan <b>unik untuk setiap transaksi</b>.",
+        "QRIS akan dibuat dinamis untuk setiap transaksi.",
         parse_mode="HTML",
-        reply_markup=main_menu()
+        reply_markup=main_menu(),
     )
 
-
-@bot.message_handler(
-    func=lambda message:
-    message.text == "🛒 Tambahan Paket VIP 3 Grup (Rp 30.000)"
-)
+@bot.message_handler(func=lambda message: message.text == "🛒 Tambahan Paket VIP 3 Grup (Rp 30.000)")
 def handle_buy_vip(message):
-    user_id = message.from_user.id
-    user_selected_package[user_id] = "vip"
-
+    user_selected_package[message.from_user.id] = "vip"
     markup = InlineKeyboardMarkup()
-    markup.add(
-        InlineKeyboardButton(
-            "💳 Buat QRIS Dinamis",
-            callback_data="create_qris_vip"
-        )
-    )
+    markup.add(InlineKeyboardButton("💳 Buat QRIS Dinamis", callback_data="create_qris_vip"))
+    bot.send_message(message.chat.id, "Anda memilih <b>Tambahan Paket VIP 3 Grup</b> — Rp 30.000.\n\nKlik tombol di bawah untuk membuat QRIS pembayaran baru.", parse_mode="HTML", reply_markup=markup)
 
-    bot.send_message(
-        message.chat.id,
-        "Anda memilih <b>Tambahan Paket VIP 3 Grup</b> — Rp 30.000.\n\n"
-        "Klik tombol di bawah untuk membuat QRIS pembayaran baru.",
-        parse_mode="HTML",
-        reply_markup=markup
-    )
-
-
-@bot.message_handler(
-    func=lambda message:
-    message.text == "⛓️ Paket Slave (Rp 30.000)"
-)
+@bot.message_handler(func=lambda message: message.text == "⛓️ Paket Slave (Rp 30.000)")
 def handle_buy_slave(message):
-    user_id = message.from_user.id
-    user_selected_package[user_id] = "slave"
-
+    user_selected_package[message.from_user.id] = "slave"
     markup = InlineKeyboardMarkup()
-    markup.add(
-        InlineKeyboardButton(
-            "💳 Buat QRIS Dinamis",
-            callback_data="create_qris_slave"
-        )
-    )
-
-    bot.send_message(
-        message.chat.id,
-        "Anda memilih <b>Paket Slave</b> — Rp 30.000.\n\n"
-        "Klik tombol di bawah untuk membuat QRIS pembayaran baru.",
-        parse_mode="HTML",
-        reply_markup=markup
-    )
-
+    markup.add(InlineKeyboardButton("💳 Buat QRIS Dinamis", callback_data="create_qris_slave"))
+    bot.send_message(message.chat.id, "Anda memilih <b>Paket Slave</b> — Rp 30.000.\n\nKlik tombol di bawah untuk membuat QRIS pembayaran baru.", parse_mode="HTML", reply_markup=markup)
 
 @bot.message_handler(func=lambda message: message.text == "⭐ Testimoni")
 def handle_testimoni(message):
     markup = InlineKeyboardMarkup()
-    markup.add(
-        InlineKeyboardButton(
-            "🔗 Buka Channel Testimoni",
-            url="https://t.me/testiwarungdosaa"
-        )
-    )
-
-    bot.send_message(
-        message.chat.id,
-        "⭐ <b>Testimoni Pelanggan WarungDosa</b>\n\n"
-        "Silakan klik tombol di bawah untuk melihat testimoni.",
-        parse_mode="HTML",
-        reply_markup=markup
-    )
-
+    markup.add(InlineKeyboardButton("🔗 Buka Channel Testimoni", url="https://t.me/testiwarungdosaa"))
+    bot.send_message(message.chat.id, "⭐ <b>Testimoni Pelanggan WarungDosa</b>\n\nSilakan klik tombol di bawah untuk melihat testimoni.", parse_mode="HTML", reply_markup=markup)
 
 @bot.message_handler(func=lambda message: message.text == "❓ Bantuan")
 def handle_faq(message):
-    bot.reply_to(
-        message,
-        "💡 <b>Panduan:</b>\n\n"
-        "1. Pilih paket.\n"
-        "2. Klik <b>Buat QRIS Dinamis</b>.\n"
-        "3. Scan QRIS dan bayar sesuai nominal yang tampil.\n"
-        "4. Bot mengecek pembayaran otomatis.\n"
-        "5. Setelah sukses, link grup dikirim otomatis.\n\n"
-        "Tidak perlu kirim screenshot bukti transfer.",
-        parse_mode="HTML"
-    )
-
+    bot.reply_to(message, "💡 <b>Panduan:</b>\n\n1. Pilih paket.\n2. Klik <b>Buat QRIS Dinamis</b>.\n3. Scan QRIS dan bayar sesuai nominal yang tampil.\n4. Bot mengecek pembayaran otomatis.\n5. Setelah sukses, link grup dikirim otomatis.\n\nTidak perlu mengirim screenshot bukti transfer.", parse_mode="HTML")
 
 @bot.message_handler(func=lambda message: message.text == "📞 Hubungi Admin")
 def handle_contact_admin(message):
     markup = InlineKeyboardMarkup()
-    markup.add(
-        InlineKeyboardButton(
-            "💬 Chat Admin Sekarang",
-            url="https://t.me/WarungDosa"
-        )
-    )
+    markup.add(InlineKeyboardButton("💬 Chat Admin Sekarang", url="https://t.me/WarungDosa"))
+    bot.send_message(message.chat.id, "💬 Silakan hubungi Admin jika mengalami kendala pembayaran.", reply_markup=markup)
 
-    bot.send_message(
-        message.chat.id,
-        "💬 Silakan hubungi Admin jika mengalami kendala pembayaran.",
-        reply_markup=markup
-    )
-
-
-@bot.callback_query_handler(
-    func=lambda call:
-    call.data in ["create_qris_vip", "create_qris_slave"]
-)
+@bot.callback_query_handler(func=lambda call: call.data in ["create_qris_vip", "create_qris_slave"])
 def process_create_qris(call):
     user_id = call.from_user.id
     pkg_code = "vip" if call.data == "create_qris_vip" else "slave"
+    bot.answer_callback_query(call.id, "Membuat QRIS dinamis...")
 
-    bot.answer_callback_query(
-        call.id,
-        "Membuat QRIS dinamis..."
-    )
-
-    # Jika masih ada transaksi pending, jangan membuat transaksi
-    # baru secara tidak sengaja.
     existing = active_transactions.get(user_id)
     if existing and existing.get("status") == "PENDING":
+        try:
+            amount = f"Rp {int(float(existing['total_amount'])):,.0f}"
+        except Exception:
+            amount = str(existing["total_amount"])
         bot.send_message(
             user_id,
             "⚠️ Anda masih memiliki pembayaran yang menunggu.\n\n"
-            f"Order ID: <code>{html.escape(existing['order_id'])}</code>\n"
-            f"Nominal: <b>Rp {int(float(existing['total_amount'])):,.0f}</b>\n"
+            f"Order ID: <code>{html.escape(str(existing['order_id']))}</code>\n"
+            f"Nominal: <b>{amount}</b>\n"
             f"Expired: <b>{html.escape(str(existing['expired_at']))}</b>",
-            parse_mode="HTML"
+            parse_mode="HTML",
         )
         return
 
     try:
         send_payment_qr(user_id, pkg_code)
-
-    except Exception as e:
-        print(f"[CREATE QR ERROR] {e}")
+    except Exception as exc:
+        print(f"[CREATE QR ERROR] {exc}")
         bot.send_message(
             user_id,
-            "❌ Gagal membuat QRIS dinamis.\n\n"
-            f"Detail: <code>{html.escape(str(e))}</code>\n\n"
+            "❌ <b>Gagal membuat QRIS.</b>\n\n"
+            f"<code>{html.escape(str(exc))}</code>\n\n"
             "Silakan coba lagi atau hubungi admin.",
-            parse_mode="HTML"
+            parse_mode="HTML",
         )
 
-
-# ============================================================
-# START
-# ============================================================
 if __name__ == "__main__":
     check_config()
-
     print("Bot QRIS Dinamis KlikQRIS berjalan...")
-
-    # Monitor pembayaran di background.
-    monitor_thread = threading.Thread(
-        target=payment_monitor,
-        daemon=True
-    )
-    monitor_thread.start()
-
-    bot.infinity_polling(
-        skip_pending=True,
-        timeout=30,
-        long_polling_timeout=30
-    )
+    threading.Thread(target=payment_monitor, daemon=True).start()
+    bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=30)
