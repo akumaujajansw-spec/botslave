@@ -1,1 +1,1 @@
-worker: python main_dynamic_klikqris.py
+worker: python slave.py
